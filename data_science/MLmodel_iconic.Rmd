@@ -1,0 +1,202 @@
+---
+title: "THE_ICONIC_Interview_Assignment_PART_2_DS"
+author: "Nikita sharma"
+date: "22/05/2019"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Import libs/dependencies
+
+```{r }
+library(jsonlite)
+library(caret)
+library(dplyr)
+library(xgboost)
+library(Matrix)
+library(corrplot)
+library(DataExplorer)
+```
+
+## Game on!
+
+Let's have a look at the data.  
+```{r }
+data <- fromJSON('data.json')
+nrow(data) 
+length(unique(data$customer_id))
+head(data)
+```
+We see that we have few duplicate customers in the dataset. We will ignore these for this activity.
+
+## Data Cleaning
+
+Let's see if missing values are present in our dataset. We will attempt to find and fix the corrupt column in the dataset.
+Here we will also clean our data, convert categorical variables to numeric using label encoding, normalizing columns etc.
+
+```{r }
+plot_missing(data)
+# days_since_last_order : is a factor of 24
+data$days_since_last_order <- data$days_since_last_order / min(data$days_since_last_order)
+
+# redpen_discount_used
+data$redpen_discount_used <- scale(data$redpen_discount_used)
+# revenue
+data$revenue <- scale(data$revenue)
+#coupon_discount_applied
+data$coupon_discount_applied <- scale(data$coupon_discount_applied)
+# average_discount_used
+data$average_discount_used <- scale(data$average_discount_used)
+
+
+# Characters to Factors for label encoding
+data$is_newsletter_subscriber <- factor(data$is_newsletter_subscriber)
+
+# Impute Zero to all missing value of numeric columns
+data[sapply(data, is.numeric)] <- lapply(data[sapply(data, is.numeric)],
+                                         function(x) ifelse(is.na(x),0, x))
+
+```
+
+We can see that days_since_last_order is a factor of 24, so will divide the variable by 24. We can also see that coupon_discount_applied has 22.05% missing values, we will fill missing values with 0.
+
+## Heuristic Approach
+As we don't have target variable here, we will generate our target variable based on following assumptions : 
+
+1. If a customer brought a male product more than 3 times than female product, we will assign the customer as Male i.e; 0.
+
+2. If a customer brought a female product more than 3 times than male product, we will assign the customer as Female i.e; 1.
+
+The model can be made stricter by making the threshold = 4 instead of 3. 
+
+
+```{r }
+sub_data <- data
+
+# Hueristics:
+# Labeling customer as Female
+# if they bought 3 times more Female product
+# than the Male products. (Make 4 time for more strict model)
+# Vice versa for Male as well.
+sub_data$gender <- -1
+sub_data$gender <- ifelse(round(sub_data$female_items/(1 + sub_data$male_items)) >= 3, 
+                          1, sub_data$gender)
+sub_data$gender <- ifelse(round(sub_data$male_items/(1+sub_data$female_items)) >= 3, 
+                          0, sub_data$gender)
+
+nrow(sub_data)
+nrow(sub_data[sub_data$gender == -1, ])
+nrow(sub_data[sub_data$gender == 1, ])
+nrow(sub_data[sub_data$gender == 0, ])
+
+train_data_raw <-  sub_data %>%  filter(gender == 1 | gender == 0)
+head(train_data_raw)
+```
+
+## Test/Train split
+
+We split our dataset into train-test in 80-20 ratio
+
+```{r }
+smp_size <- floor(0.80 * nrow(train_data_raw))
+set.seed(123)
+train_ind <- sample(seq_len(nrow(train_data_raw)), size = smp_size)
+train <- train_data_raw[train_ind, ]
+test <- train_data_raw[-train_ind, ]
+
+nrow(train) 
+nrow(test) 
+```
+
+## XG Boost
+We are using Xgboost Classification model as our target variable is a class type.
+
+```{r }
+target <- train$gender
+dtrain <- sparse.model.matrix( gender ~ . -customer_id, data = train)[,-1]
+dtest <- sparse.model.matrix( gender ~ . -customer_id, data = test)[,-1]
+
+
+best_param <- list()
+best_seednumber <- 1234
+best_rmse <- Inf
+best_rmse_index <- 0
+
+
+set.seed(123)
+for (iter in 1:20) {  
+  param <- list(objective = "binary:logistic",
+                eval_metric = "error",
+                max_depth = sample(6:10, 1),
+                eta = runif(1, .01, .3),
+                gamma = runif(1, 0.0, 0.2), 
+                subsample = runif(1, .6, .9),
+                colsample_bytree = runif(1, .5, .8), 
+                min_child_weight = sample(1:40, 1),
+                max_delta_step = sample(1:10, 1)
+  )
+  
+  cv.nround <-  20  # <<<<<
+  cv.nfold <-  5 # 5-fold cross-validation
+  seed.number  <-  sample.int(10000, 1) # set seed for the cv
+  
+  set.seed(seed.number)
+  mdcv <- xgb.cv(data = dtrain, params = param, label=target,  
+                 nfold = cv.nfold, nrounds = cv.nround,
+                 verbose = F, early_stopping_rounds = 8, maximize = FALSE)
+  
+  min_error_index  <-  which.min(mdcv$evaluation_log[, test_error_mean])
+  min_error <-  min(mdcv$evaluation_log[, test_error_mean])
+  
+  
+  if (min_error < best_rmse) {
+    print('best error:')
+    print(min_error)
+    
+    best_rmse <- min_error
+    best_rmse_index <- min_error_index
+    best_seednumber <- seed.number
+    best_param <- param
+  }
+}
+
+
+# The best index (min_rmse_index) is the best "nround" in the model
+nround = best_rmse_index
+set.seed(best_seednumber)
+xg_mod <- xgboost(data = dtrain,  label=target, params = best_param, nround = nround, verbose = F)
+
+# Calculate RMSE
+# predicting on test dataset
+pred <- predict(xg_mod, newdata = dtest)
+
+out_test <- select(test, customer_id, gender)
+out_test$predicted_gender_raw <- pred
+out_test$predicted_gender <- round(pred)
+
+# ERROR
+nrow(out_test[out_test$predicted_gender != out_test$gender, ]) / nrow(out_test)
+
+```
+## Feature Importance 
+```{r }
+
+importance <- xgb.importance(feature_names = colnames(dtrain), model = xg_mod)
+print(head(importance, 20))
+
+```
+## Full dataset prediction
+
+```{r }
+dtest_full <- sparse.model.matrix( ~ . -customer_id, data = data)[,-1]
+full_pred <- select(data, customer_id)
+full_pred$gender <- round(predict(xg_mod, newdata = dtest_full))
+full_pred$gender <- ifelse(full_pred$gender == 1, "F", "M")
+head(full_pred)
+```
+
